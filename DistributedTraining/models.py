@@ -5,21 +5,48 @@ import time
 
 # CNN Model 
 #         Parameters: 896450 
-#         runtime: 0.0235 seconds
+#         runtime: 0.0228 seconds
 # ViT Model 
 #         Parameters: 17430914 
-#         runtime: 0.0607 seconds
+#         runtime: 0.0634 seconds
 # Hybrid Model 
 #         Parameters: 3798146 
-#         runtime: 0.0159 seconds
-# Segmentation Model 
-#         Parameters: 7407330 
-#         runtime: 0.0247 seconds
-def compare_models():
+#         runtime: 0.0189 seconds
+
+#################################
+# attention experiments: num_layers
+#################################
+# Segmentation Model 4 layers att
+#         Parameters: 8722145 
+#         runtime: 0.0282 seconds
+#         final accuracy: 95.68%
+# Segmentation Model 3 layers att
+#         Parameters: 7407073 
+#         runtime: 0.0260 seconds
+#         final accuracy: 95.84%
+# Segmentation Model 2 layers att
+#         Parameters: 6092001 
+#         runtime: 0.0216 seconds
+#         final accuracy: 95.26%
+
+#################################
+# attention experiments: patch_size
+#################################
+# I think a smaller patch size and increased dataset will have a substantial effect on results.
+#  - With patch size 8, there is noticable patching on output
+#  - I am achieving 95% which is considerably good (best results out of 3 att layers), but i want tighter segmentations.
+
+# Segmentation Model 4 layers att, patch size 4 (4 times more attention paramt)
+#         Parameters: 7195361 
+#         runtime: 0.0654 seconds
+#         final accuracy: 95.09%
+
+
+def compare_models(cfg_seg):
     model_cnn = CNNModel()
     model_vit = ViTModel()
     model_hybrid = HybridModel()
-    model_seg = ClassSegmentationModel()
+    model_seg = ClassSegmentationModel(cfg_seg)
 
     total_params_cnn = sum(p.numel() for p in model_cnn.parameters())
     total_params_vit = sum(p.numel() for p in model_vit.parameters())
@@ -50,6 +77,9 @@ def compare_models():
     print(f"Hybrid Model \n\tParameters: {total_params_hybrid} \n\truntime: {runtime_hybrid:.4f} seconds")
     print(f"Segmentation Model \n\tParameters: {total_params_seg} \n\truntime: {runtime_seg:.4f} seconds")
 
+#################################
+# Standard Models
+#################################
 
 class CNNModel(torch.nn.Module):
     def __init__(self):
@@ -250,10 +280,18 @@ class HybridModel(torch.nn.Module):
 
         return output
 
+#################################
+# Segmentation Models
+#################################
 
-
-class ClassSegmentationModel(torch.nn.Module):
-    def __init__(self, input_shape=(3, 256, 256), patch_size=8, num_classes=2, num_dims=256, num_heads=8, num_layers=3):
+class InitialClassSegmentationModel(torch.nn.Module):
+    def __init__(self, cfg):
+        input_shape = cfg.get("input_shape", (3, 256, 256))
+        patch_size = cfg.get("patch_size", 8)
+        num_classes = cfg.get("num_classes", 2)
+        num_dims = cfg.get("num_dims", 256)
+        num_heads = cfg.get("num_heads", 8)
+        num_layers = cfg.get("num_layers", 4)
 
         super(ClassSegmentationModel, self).__init__()
 
@@ -312,13 +350,11 @@ class ClassSegmentationModel(torch.nn.Module):
             torch.nn.ConvTranspose2d(self.cnn_out_channels, 32, kernel_size=2, stride=2),
             torch.nn.ReLU(),
         )
-        # (B, 64, 128, 128) -> (B, 2, 256, 256)
+        # (B, 64, 128, 128) -> (B, 1, 256, 256)
         self.upsample2 = torch.nn.Sequential(
-            torch.nn.ConvTranspose2d(64, 2, kernel_size=2, stride=2),
-            torch.nn.ReLU(),
+            torch.nn.ConvTranspose2d(64, 1, kernel_size=2, stride=2),
         )
 
-        self.sigmoid = torch.nn.Sigmoid()
         
     def forward(self, x):
         B, _, H, W = x.shape
@@ -364,6 +400,137 @@ class ClassSegmentationModel(torch.nn.Module):
         x = self.upsample1(image_tokens)
         output = self.upsample2(torch.cat([x, conv1], dim=1))
 
-        output = self.sigmoid(output)
+        return output
+
+class ClassSegmentationModel(torch.nn.Module):
+    def __init__(self, cfg):
+        input_shape = cfg.get("input_shape", (3, 512, 512))
+        patch_size = cfg.get("patch_size", 8)
+        num_classes = cfg.get("num_classes", 2)
+        num_dims = cfg.get("num_dims", 256)
+        num_heads = cfg.get("num_heads", 8)
+        num_layers = cfg.get("num_layers", 4)
+        self.num_convs = 3
+
+        super(ClassSegmentationModel, self).__init__()
+
+        self.num_dims = num_dims
+        self.patch_size = patch_size
+        self.num_classes = num_classes
+        self.patches = 64
+        self.cnn_out_channels = 128
+        self.h = input_shape[1] // ((2**self.num_convs)*self.patch_size)
+        self.w = input_shape[2] // ((2**self.num_convs)*self.patch_size)
+        self.patches = self.h * self.w
+
+        # CNN
+        self.conv1 = torch.nn.Sequential(
+            # (3,512,512) -> (32,256,256) 
+            torch.nn.Conv2d(input_shape[0], 32, kernel_size=3, stride=1, padding=1),
+            torch.nn.MaxPool2d(kernel_size=2, stride=2),
+            torch.nn.ReLU(),
+        )
+
+        self.conv2 = torch.nn.Sequential(
+            # (32,256,256) -> (64,128,128)
+            torch.nn.Conv2d(32,  64, kernel_size=3, stride=1, padding=1),
+            torch.nn.MaxPool2d(kernel_size=2, stride=2),
+            torch.nn.ReLU(),
+        )
+
+        self.conv3 = torch.nn.Sequential(
+            # (64,128,128) -> (128,64,64)
+            torch.nn.Conv2d(64,  self.cnn_out_channels, kernel_size=3, stride=1, padding=1),
+            torch.nn.MaxPool2d(kernel_size=2, stride=2),
+            torch.nn.ReLU(),
+        )
+
+        # projection to transformer dimension
+        self.proj = torch.nn.Linear(self.cnn_out_channels*patch_size*patch_size, num_dims)
+        self.inv_proj = torch.nn.Linear(num_dims, self.cnn_out_channels*patch_size*patch_size)
+
+        self.cls = torch.nn.Parameter(torch.randn(1, 1, num_dims))
+        self.positional_embedding = torch.nn.Parameter(
+            torch.randn(1, self.patches + 1, num_dims)
+        )
+
+        # transformer for attention
+        self.encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model=num_dims, 
+            nhead=num_heads, 
+            batch_first=True,
+            dropout=0.1
+        )
+        self.transformer = torch.nn.TransformerEncoder(
+            self.encoder_layer,
+            num_layers=num_layers
+        )
+
+        # normalization
+        self.norm = torch.nn.LayerNorm(num_dims)
+
+        # upsampling head with skip connections
+
+        # (B, 128, 64, 64) -> (B, 64, 128, 128)
+        self.upsample1 = torch.nn.Sequential(
+            torch.nn.ConvTranspose2d(self.cnn_out_channels, 64, kernel_size=2, stride=2),
+            torch.nn.ReLU(),
+        )
+        # (B, 64, 128, 128) -> (B, 32, 256, 256)
+        self.upsample2 = torch.nn.Sequential(
+            torch.nn.ConvTranspose2d(128, 32, kernel_size=2, stride=2),
+            torch.nn.ReLU(),
+        )
+        # (B, 32, 256, 256) -> (B, 1, 512, 512)
+        self.upsample3 = torch.nn.Sequential(
+            torch.nn.ConvTranspose2d(64, 1, kernel_size=2, stride=2),
+        )
+
+        
+    def forward(self, x):
+        B, _, H, W = x.shape
+        
+
+        conv1 = self.conv1(x) # -> (B, 32, 256, 256)
+        conv2 = self.conv2(conv1) # -> (B, 64, 128, 128)
+        conv3 = self.conv3(conv2) # -> (B, 128, 64, 64)
+
+        # (B, 64, 64, 64) -> (B, 64, image_patches[1] // patch_size, image_patches[2] // patch_size, patch_size, patch_size)
+        x = conv3.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        # (B, 64, 8, 8, 8, 8) -> (B, 8, 8, 64, 8, 8)
+        x = x.permute(0, 2, 3, 1, 4, 5).contiguous()
+        # (B, 8, 8, 64, 8, 8) -> (B, 64, 64*8*8)
+        x = x.view(B, -1,  self.cnn_out_channels * self.patch_size * self.patch_size)
+
+        # project to num_dims
+        x = self.proj(x)
+
+        cls_tokens = self.cls.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        x = x + self.positional_embedding
+
+        x = self.transformer(x)
+        
+        x = self.norm(x)
+        
+        #cls_output = x[:, 0] 
+        image_tokens = x[:, 1:]
+
+        # project to patches
+        image_tokens = self.inv_proj(image_tokens)
+
+        # reshape image tokens back to image grid
+        # (B, 64, 64*8*8) -> (B, 8, 8, 64, 8, 8)
+        image_tokens = image_tokens.view(B, self.h, self.w, self.cnn_out_channels, self.patch_size, self.patch_size)
+        # (B, 8, 8, 64, 8, 8) -> (B, 64, 8, 8, 8, 8)
+        image_tokens = image_tokens.permute(0, 3, 1, 4, 2, 5).contiguous()
+        # (B, 64, image_patches[1] // patch_size, image_patches[2] // patch_size, patch_size, patch_size) -> (B, 64, 64, 64)
+        image_tokens = image_tokens.view(B, self.cnn_out_channels, self.h * self.patch_size, self.w * self.patch_size)
+        
+        # upsample back to original image size with skips
+        x = self.upsample1(image_tokens)
+        x = self.upsample2(torch.cat([x, conv2], dim=1))
+        output = self.upsample3(torch.cat([x, conv1], dim=1))
 
         return output

@@ -16,47 +16,11 @@ import torch.distributed as dist
 
 import time
 
-
-class CNNModel(torch.nn.Module):
-    def __init__(self):
-        super(CNNModel, self).__init__()
-        self.conv1 = torch.nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
-        self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.conv3 = torch.nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
-
-        self.adaptive_pool = torch.nn.AdaptiveAvgPool2d((7, 7))
-
-        self.fc1 = torch.nn.Linear(128 * 7 * 7, 128)
-        self.fc2 = torch.nn.Linear(128, 2)
-
-    def forward(self, x):
-        # conv1
-        # 256 x 256 x 3 -> 128 x 128 x 32
-        x = F.relu(self.conv1(x))
-        x = F.max_pool2d(x, 2)
-
-        # conv2
-        # 128 x 128 x 32 -> 64 x 64 x 64
-        x = F.relu(self.conv2(x))
-        x = F.max_pool2d(x, 2)
-
-        # conv3
-        # 64 x 64 x 64 -> 32 x 32 x 128
-        x = F.relu(self.conv3(x))
-        x = F.max_pool2d(x, 2)
-
-        x = self.adaptive_pool(x)
-
-        # flatten
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
-    
+from models import *
 
 
 def run_train_cpu(epochs:int=30, batch_size:int=8, lr:float=0.0001):
-    model = CNNModel()
+    model = HybridModel()
     path = "~/Desktop/animals"
 
     dataset = datasets.ImageFolder(
@@ -136,8 +100,17 @@ def run_train_ray(config):
     world_size = context.get_world_size()
     rank = context.get_world_rank()
 
-    model = CNNModel().to(device)
-    model = ray.train.torch.prepare_model(model)
+    model = HybridModel().to(device)
+
+    if world_size > 1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[rank],
+            output_device=rank,
+            find_unused_parameters=True  # PyTorch DDP argument
+        )
+    else:
+        model = ray.train.torch.prepare_model(model)
 
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -247,16 +220,14 @@ def run_train_ray(config):
 
 
 if __name__ == "__main__":
-    start = time.time()
-    run_train_cpu()
-    print("time to train with cpu:", time.time() - start)
-
-
-if __name__ == "__main__":
 
     start = time.time()
 
-    ray.init("ray://localhost:10001")  # Change URI to your cluster address
+    ray.init("ray://localhost:10001", 
+            runtime_env={
+                "working_dir": os.path.dirname(__file__)
+            }
+        )  # Change URI to your cluster address
 
     scaling_config = ray.train.ScalingConfig(num_workers=4, use_gpu=True)
     run_config = ray.train.RunConfig(storage_path="~/", name="test_run_CNN")
@@ -277,5 +248,13 @@ if __name__ == "__main__":
     result = trainer.fit()
 
     print("time to train with ray:", time.time() - start)
+
+    ray.shutdown()
+
+
+    start = time.time()
+    run_train_cpu()
+    print("time to train with cpu:", time.time() - start)
+
 
 
